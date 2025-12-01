@@ -37,15 +37,37 @@
 
 #include "driver/i2s.h"
 
+#include <WiFi.h>
+#include <PubSubClient.h>  //by nick v2.8
+#include <time.h>
+
+// ----------- USER SETTINGS ------------
+const char* ssid = "Your WIFI SSID";
+const char* password = "Your WIFI Password";
+
+const char* mqtt_server = "broker.mqtt.cool";  // e.g., "test.mosquitto.org"
+const int mqtt_port = 1883;                    // default MQTT port
+const char* mqtt_user = "";                    // optional
+const char* mqtt_pass = "";                    // optional
+
+const char* publish_topic = "vishal/project/snoring_detection";  // replace with topic from above
+// --------------------------------------
+
 #define MODE_PIN (1)
 #define LED_PIN 8   // Your NeoPixel data pin
 #define NUM_LEDS 1  // Number of LEDs in the strip
+
+#define Vibrator 22
+
+// Create WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 /** Audio buffers, pointers and selectors */
 typedef struct {
-  int16_t *buffer;
+  int16_t* buffer;
   uint8_t buf_ready;
   uint32_t buf_count;
   uint32_t n_samples;
@@ -66,10 +88,18 @@ void setup() {
 
   pinMode(MODE_PIN, OUTPUT);
   digitalWrite(MODE_PIN, LOW);  //Configure the Microphone to Receive Left Channel Data
-                                //digitalWrite(MODE_PIN,HIGH);//Configure the Microphone to Receive Right Channel Data
+  //digitalWrite(MODE_PIN,HIGH);//Configure the Microphone to Receive Right Channel Data
+
+  pinMode(Vibrator, OUTPUT);
+  digitalWrite(Vibrator, LOW);
 
   strip.begin();
   strip.show();  // Initialize all pixels to OFF
+
+  setup_wifi();  // connect WiFi
+  client.setServer(mqtt_server, mqtt_port);
+
+  initTime();
 
   // comment out the below line to cancel the wait for USB connection (needed for native USB)
   while (!Serial)
@@ -100,6 +130,12 @@ void setup() {
  * @brief      Arduino main function. Runs the inferencing loop.
  */
 void loop() {
+
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
   bool m = microphone_inference_record();
   if (!m) {
     ei_printf("ERR: Failed to record audio...\n");
@@ -126,7 +162,8 @@ void loop() {
     snoring: 0.035156
     z_openset: 0.964844
     */
-    static unsigned long last_time_led = 0;
+  static unsigned long last_time_led = 0;
+  static bool is_snoring = 0;
 
   for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
     if ("snoring" == result.classification[ix].label) {
@@ -134,11 +171,21 @@ void loop() {
         ei_printf("Snoring_detected\n");
         strip.setPixelColor(0, strip.Color(255, 0, 0));
         strip.show();
+        Vibration_pulse();
+        if (!is_snoring) {
+          publishMessage("Snoring Detected !");
+          is_snoring = 1;
+        }
         last_time_led = millis();
       } else {
-        if(millis()-last_time_led > 3000){
-        strip.setPixelColor(0, strip.Color(0, 255, 0));
-        strip.show();
+        if (millis() - last_time_led > 5000) {
+          strip.setPixelColor(0, strip.Color(0, 255, 0));
+          strip.show();
+          if (is_snoring) {
+            publishMessage("No Snoring !");
+            is_snoring = 0;
+          }
+          digitalWrite(Vibrator, LOW);
         }
       }
     }
@@ -148,12 +195,34 @@ void loop() {
   }
 
 
-
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
   ei_printf("    anomaly score: ");
   ei_printf_float(result.anomaly);
   ei_printf("\n");
 #endif
+}
+
+bool ledState = false;    // current LED state
+unsigned long previousMillis = 0;
+
+void Vibration_pulse() {
+  unsigned long currentMillis = millis();
+
+  if (ledState == false) {
+    // LED is OFF → wait 1 sec before turning ON
+    if (currentMillis - previousMillis >= 1000) {
+      ledState = true;
+      digitalWrite(Vibrator, HIGH);
+      previousMillis = currentMillis;
+    }
+  } else {
+    // LED is ON → wait 200 ms before turning OFF
+    if (currentMillis - previousMillis >= 100) {
+      ledState = false;
+      digitalWrite(Vibrator, LOW);
+      previousMillis = currentMillis;
+    }
+  }
 }
 
 static void audio_inference_callback(uint32_t n_bytes) {
@@ -167,7 +236,7 @@ static void audio_inference_callback(uint32_t n_bytes) {
   }
 }
 
-static void capture_samples(void *arg) {
+static void capture_samples(void* arg) {
 
   const int32_t i2s_bytes_to_read = (uint32_t)arg;
   size_t bytes_read = i2s_bytes_to_read;
@@ -175,7 +244,7 @@ static void capture_samples(void *arg) {
   while (record_status) {
 
     /* read data at once from i2s */
-    i2s_read((i2s_port_t)0, (void *)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
+    i2s_read((i2s_port_t)0, (void*)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
 
     if (bytes_read <= 0) {
       ei_printf("Error in I2S read : %d", bytes_read);
@@ -212,7 +281,7 @@ static void capture_samples(void *arg) {
  * @return     { description_of_the_return_value }
  */
 static bool microphone_inference_start(uint32_t n_samples) {
-  inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
+  inference.buffer = (int16_t*)malloc(n_samples * sizeof(int16_t));
 
   if (inference.buffer == NULL) {
     return false;
@@ -230,7 +299,7 @@ static bool microphone_inference_start(uint32_t n_samples) {
 
   record_status = true;
 
-  xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void *)sample_buffer_size, 10, NULL);
+  xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void*)sample_buffer_size, 10, NULL);
 
   return true;
 }
@@ -254,7 +323,7 @@ static bool microphone_inference_record(void) {
 /**
  * Get raw audio signal data
  */
-static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float* out_ptr) {
   numpy::int16_to_float(&inference.buffer[offset], out_ptr, length);
 
   return 0;
@@ -311,3 +380,82 @@ static int i2s_deinit(void) {
 #if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
 #error "Invalid model for current sensor."
 #endif
+
+// Function to connect to WiFi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Function to connect/reconnect to MQTT broker
+void reconnect() {
+  // Loop until connected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+
+    // Create a unique client ID
+    String clientId = "ESP32-Client-";
+    clientId += String(random(0xffff), HEX);
+
+    // Attempt to connect
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("connected!");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
+
+// ----------- MQTT Publish Function -----------
+// Publish a String message with IST date & time
+// Format: message:YYYY-MM-DD HH:MM:SS
+void publishMessage(String msg) {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);  // convert to local (IST) time
+
+  char timeString[30];
+  strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+  String finalMessage = msg + ":" + String(timeString);
+
+  Serial.print("Publishing: ");
+  Serial.println(finalMessage);
+
+  client.publish(publish_topic, finalMessage.c_str());
+}
+// ---------------------------------------------
+
+
+// Initialize NTP for real timestamp
+void initTime() {
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.print("Waiting for NTP time sync...");
+  time_t now = time(nullptr);
+
+  while (now < 100000) {  // wait for valid time
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+
+  Serial.println("\nTime synchronized!");
+}
